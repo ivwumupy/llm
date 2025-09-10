@@ -1,0 +1,20 @@
+[project]
+name = "llm"
+version = "0.1.0"
+requires-python = ">=3.13"
+
+dependencies = [
+    "regex>=2025.9.1",
+]
+
+[project.optional-dependencies]
+jax_cuda12 = [
+    "flax>=0.11.2",
+    "jax[cuda12]>=0.7.1",
+    "optax>=0.2.5",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.30.1",
+]
