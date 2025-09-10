@@ -13,6 +13,22 @@ jax_cuda12 = [
     "jax[cuda12]>=0.7.1",
     "optax>=0.2.5",
 ]
+tensorboard = [
+    "tensorboard>=2.20.0",
+]
+torch_cpu = [
+    "torch>=2.8.0",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [dependency-groups]
 dev = [
