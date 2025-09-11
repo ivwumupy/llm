@@ -1,8 +1,12 @@
 from dataclasses import dataclass
+from functools import partial
+from typing import Any
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import optax
+from jax import lax
 
 from spargel_llm.layers.jax import (
     DotProductAttention,
@@ -17,7 +21,7 @@ from spargel_llm.layers.jax import (
 
 
 @dataclass
-class MicroLMConfig:
+class LLMConfig:
     vocab_size: int
     embed_dim: int
     qk_dim: int
@@ -28,13 +32,14 @@ class MicroLMConfig:
     position_encoding: PositionEncodingStrategy = PositionEncodingStrategy.ALL_YOU_NEED
 
 
-class MicroLM(nnx.Module):
+class LLM(nnx.Module):
+    config: LLMConfig
     attentions: list[DotProductAttention]
     feed_forwards: list[FeedForward]
 
     def __init__(
         self,
-        config: MicroLMConfig,
+        config: LLMConfig,
         *,
         rngs: nnx.Rngs,
     ):
@@ -102,3 +107,67 @@ class MicroLM(nnx.Module):
 
         x_norm = self.embed_normalization(x)
         return self.lm_head(x_norm)
+
+
+def loss_fn(model: LLM, x: jax.Array, y: jax.Array):
+    """
+    Args:
+        x: (batch_size, seq_len) dtype=int
+        y: (batch_size, seq_len) dtype=int
+    """
+    assert x.shape == y.shape
+    shape = x.shape
+    mask = jnp.full(shape, True, dtype=jnp.bool)
+    logits = model(x, padding_mask=mask)
+    return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, labels=y))
+
+
+@dataclass(frozen=True)
+class BatchConfig:
+    batch_size: int
+    seq_len: int
+
+
+@partial(jax.jit, static_argnames=["config"])
+def get_batch(key, data, config: BatchConfig):
+    """
+    Args:
+        key: the random key to be consumed
+    """
+    # the second argument is `ix` (the only one that is batched)
+    dynamic_slice_vmap = jax.vmap(lax.dynamic_slice, in_axes=(None, 0, None))
+    ix = jax.random.randint(
+        key,
+        shape=(config.batch_size, 1),
+        minval=0,
+        maxval=len(data) - config.seq_len,
+    )
+    x = dynamic_slice_vmap(data, ix, (config.seq_len,))
+    y = dynamic_slice_vmap(data, ix + 1, (config.seq_len,))
+    return x, y
+
+
+@partial(nnx.jit, static_argnames=["config"])
+def train_step(model, key, optimizer, metrics, data, config: BatchConfig):
+    key, subkey = jax.random.split(key)
+    batch = get_batch(subkey, data, config)
+    loss, grads = nnx.value_and_grad(loss_fn)(model, *batch)
+    metrics.update(values=loss)
+    optimizer.update(model, grads)
+    return loss, key
+
+
+class TrainLoop:
+    def __init__(
+        self, model: LLM, learning_rate: float, batch_size: int, seq_len: int, data
+    ):
+        self.model = model
+        self.optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.Param)
+        self.data = data
+        self.config = BatchConfig(batch_size, seq_len)
+        self.metrics = nnx.MultiMetric(loss=nnx.metrics.Average())
+
+    def train_step(self, key):
+        return train_step(
+            self.model, key, self.optimizer, self.metrics, self.data, self.config
+        )
