@@ -1,12 +1,12 @@
-from collections.abc import Callable
 import enum
 import math
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
-from flax import nnx
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
+from flax import nnx
 from jax import lax
 
 
@@ -118,6 +118,46 @@ class LayerNorm(nnx.Module):
         return result
 
 
+class Sequential(nnx.Module):
+    def __init__(self, layers):
+        self.layers = layers
+
+    def __call__(self, *args):
+        output: Any = None
+        for i, f in enumerate(self.layers):
+            assert callable(f)
+            if i > 0:
+                if isinstance(output, tuple):
+                    args = output
+                else:
+                    args = (output,)
+            output = f(*args)
+        return output
+
+
+class FeedForward(nnx.Module):
+    """
+    A fully connected feed-forward network of depth 2, for using in transformers.
+        y = ReLU(x W_1 + b_1) W_2 + b_2
+    """
+
+    def __init__(
+        self, input_dim: int, output_dim: int, hidden_dim: int, *, rngs: nnx.Rngs
+    ):
+        self.layers = Sequential(
+            [
+                Linear(input_dim, hidden_dim, rngs=rngs),
+                Linear(hidden_dim, output_dim, rngs=rngs),
+            ]
+        )
+
+    def __call__(self, x: jax.Array):
+        return self.layers(x)
+
+
+NEG_INF = jnp.finfo(jnp.float32).min
+
+
 def generic_dot_product_attention(
     q: jax.Array,
     k: jax.Array,
@@ -147,8 +187,7 @@ def generic_dot_product_attention(
         dk = k.shape[-1]
         qk *= lax.rsqrt(float(dk))
     if mask is not None:
-        neg_inf = jnp.finfo(jnp.float32).min
-        qk = jnp.where(mask, qk, neg_inf)
+        qk = jnp.where(mask, qk, NEG_INF)
     s = jnn.softmax(qk, axis=-1)
     return jnp.einsum("...ij,...jk->...ik", s, v)
 
@@ -186,26 +225,6 @@ class DotProductAttention(nnx.Module):
         k1 = k @ self.W_k
         v1 = v @ self.W_v
         return generic_dot_product_attention(q1, k1, v1, mask, use_scale=self.use_scale)
-
-
-class FeedForward(nnx.Module):
-    """
-    A fully connected feed-forward network of depth 2, for using in transformers.
-        y = ReLU(x W_1 + b_1) W_2 + b_2
-    """
-
-    def __init__(
-        self, input_dim: int, output_dim: int, hidden_dim: int, *, rngs: nnx.Rngs
-    ):
-        self.W_1 = nnx.Param(rngs.params.uniform((input_dim, hidden_dim)))
-        self.b_1 = nnx.Param(rngs.params.uniform((hidden_dim,)))
-        self.W_2 = nnx.Param(rngs.params.uniform((hidden_dim, output_dim)))
-        self.b_2 = nnx.Param(rngs.params.uniform((output_dim,)))
-
-    def __call__(self, x: jax.Array):
-        y = x @ self.W_1 + self.b_1
-        y = jnn.relu(y)
-        return y @ self.W_2 + self.b_2
 
 
 def all_you_need_init(block_size: int, embed_dim: int):
