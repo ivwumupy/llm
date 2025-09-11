@@ -94,6 +94,9 @@ class LLM(nnx.Module):
 
         mask = padding_mask[:, jnp.newaxis] & padding_mask[..., jnp.newaxis]
 
+        causal_mask = jnp.tri(seq_len, dtype=jnp.bool)
+        mask = mask & causal_mask
+
         x = self.token_embed(input)
 
         if self.pos_embed is not None:
