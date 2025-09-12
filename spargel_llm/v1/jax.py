@@ -85,7 +85,8 @@ class LLM(nnx.Module):
     def __call__(self, input: jax.Array, padding_mask: jax.Array):
         """
         Args:
-            input: shape (...batch, block_size). an array of token ids
+            input: shape (..., seq_len). an array of token ids
+            padding_mask (jax.Array): (..., seq_len)
         """
         seq_len = input.shape[-1]
         assert seq_len == self.config.block_size

@@ -1,7 +1,6 @@
 import enum
 import math
-from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import jax
 import jax.nn as jnn
@@ -135,6 +134,16 @@ class Sequential(nnx.Module):
         return output
 
 
+class ReLU(nnx.Module):
+    def __call__(self, x: jax.Array):
+        return jax.nn.relu(x)
+
+
+class SiLU(nnx.Module):
+    def __call__(self, x: jax.Array):
+        return jax.nn.silu(x)
+
+
 class FeedForward(nnx.Module):
     """
     A fully connected feed-forward network of depth 2, for using in transformers.
@@ -147,6 +156,7 @@ class FeedForward(nnx.Module):
         self.layers = Sequential(
             [
                 Linear(input_dim, hidden_dim, rngs=rngs),
+                ReLU(),
                 Linear(hidden_dim, output_dim, rngs=rngs),
             ]
         )
