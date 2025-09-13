@@ -1,268 +1,242 @@
-# %%
-# %load_ext autoreload
-# %autoreload 2
-
-# %%
-import time
-from datetime import datetime
-from random import Random
-
 import torch
-import torch.optim as optim
+import torch.nn as nn
 from torch import Tensor
 
-# from torch.utils.tensorboard import SummaryWriter
 
-from spargel_llm.data_source import PlainTextSource
-from spargel_llm.tokenizer import UnicodeTokenizer
-from spargel_llm.v1.torch import LLM, calculate_loss
+def scaled_dot_product(
+    Q: Tensor,
+    K: Tensor,
+    V: Tensor,
+    *,
+    mask: Tensor,
+) -> Tensor:
+    """
+    Args:
+        Q: (..., cnt_q, d_key)
+        K: (..., cnt_k, d_key)
+        V: (..., cnt_k, d_value)
 
-# %%
-torch.set_num_threads(16)
-torch.set_printoptions(linewidth=200)
+        mask: (..., cnt_q, cnt_k)
+    Returns:
+        (..., cnt_q, d_value)
+    """
 
-# writer = SummaryWriter("runs/llm_" + datetime.now().isoformat())
+    torch._assert(Q.size(-1) == K.size(-1), "d_key not matched")
+    torch._assert(K.size(-2) == V.size(-2), "cnt_k not matched")
 
-# %%
-max_seq_len = 64
+    cnt_q, cnt_k = Q.size(-2), K.size(-2)
 
-text_file = "nietzsche.txt"
+    torch._assert(mask.dtype == torch.bool, "mask dtype != bool")
+    torch._assert(mask.size(-2) == cnt_q, "bad mask size (-2)")
+    torch._assert(mask.size(-1) == cnt_k, "bad mask size (-1)")
 
-# %%
-with open(text_file) as f:
-    text = f.read()
+    # (..., cnt_q, cnt_k)
+    scores = torch.einsum("...ik, ...jk -> ...ij", Q, K)
 
-print("text length:", len(text))
+    # native code bug in PyTorch library
+    # scores = do_mask(scores, mask)
+    scores = scores.masked_fill(mask, -1e9)
 
-random = Random()
-
-text_source = PlainTextSource(text, max_seq_len + 1, max_seq_len + 1, random=random)
-
-reserved_vocab = ["<|pad|>", "<|unknown|>"]
-PAD, UNKNOWN = range(0, len(reserved_vocab))
-
-tokenizer = UnicodeTokenizer.train_from_text(text, reserved_vocab, unknown=UNKNOWN)
-
-print("vocab_size:", tokenizer.vocab_size)
-
-print("example texts:")
-for _ in range(16):
-    print("  " + repr(text_source.sample()))
-
-
-# %%
-def prepare_data(batch_size: int) -> tuple[Tensor, Tensor, Tensor]:
-    inputs, masks, targets = [], [], []
-    for text in text_source.sample_multiple(batch_size):
-        tokens = tokenizer.encode(text)
-        input_tokens = tokens[:max_seq_len]
-        target_tokens = tokens[1 : max_seq_len + 1]
-        input_tokens += (max_seq_len - len(input_tokens)) * [PAD]
-        target_tokens += (max_seq_len - len(target_tokens)) * [PAD]
-
-        cut_pos = max_seq_len
-        # cut_pos = random.randint(max_seq_len // 2, max_seq_len)
-        for i in range(cut_pos, max_seq_len):
-            input_tokens[i] = PAD
-            target_tokens[i] = PAD
-
-        inputs.append(torch.tensor(input_tokens))
-        targets.append(torch.tensor(target_tokens))
-
-        # padding mask
-        mask = torch.zeros(max_seq_len, dtype=torch.bool)
-        mask[cut_pos:] = True
-        masks.append(mask)
-
-    return torch.stack(inputs), torch.stack(masks), torch.stack(targets)
+    return scores @ V
 
 
-example_inputs, example_masks, example_targets = prepare_data(16)
-print("example inputs:")
-for input in example_inputs:
-    print("  " + repr(tokenizer.decode(input.tolist())))
+class Attention(nn.Module):
+    """Multihead scaled dot-product attention
 
-# %%
-# torch._dynamo.config.compiled_autograd = True
+    Args:
+        x: (..., seq_len, d_in)
+        mask (Optional): (..., seq_len), dtype=bool
+    Returns:
+        (..., seq_len, d_out)
+    """
+
+    def __init__(
+        self,
+        cnt_h: int,
+        d_in: int,
+        d_out: int,
+        d_key: int,
+        d_value: int,
+    ):
+        """
+        Args:
+            cnt_h: number of heads
+            d_in: input dimension
+            d_out: output dimension
+            d_key: key dimension
+            d_value: value dimension
+        """
+        super().__init__()
+
+        self._cnt_h = cnt_h
+
+        self._W_q = nn.Parameter(torch.rand(cnt_h, d_in, d_key))
+        self._W_k = nn.Parameter(torch.rand(cnt_h, d_in, d_key))
+        self._W_v = nn.Parameter(torch.rand(cnt_h, d_in, d_value))
+        self._W_o = nn.Parameter(torch.rand(cnt_h, d_value, d_out))
+
+    def forward(self, x: Tensor, mask: Tensor) -> Tensor:
+        seq_len = x.size(-2)
+        torch._assert(mask.size(-1) == seq_len, "bad mask size")
+
+        # x: (..., seq_len, d_in)
+
+        # W_q: (cnt_h, d_in, d_key)
+        Q = torch.einsum(
+            "ijk, ...lj -> ...ilk", self._W_q, x
+        )  # (..., cnt_h, seq_len, d_key)
+
+        # W_k: (cnt_h, d_in, d_key)
+        K = torch.einsum(
+            "ijk, ...lj -> ...ilk", self._W_k, x
+        )  # (..., cnt_h, seq_len, d_key)
+
+        # W_v: (cnt_h, d_in, d_value)
+        V = torch.einsum(
+            "ijk, ...lj -> ...ilk", self._W_v, x
+        )  # (..., cnt_h, seq_len, d_value)
+
+        mask = mask.unsqueeze(-2) | mask.unsqueeze(-1)
+        # mask: (..., seq_len, seq_len) | (seq_len, seq_len) | None
+        mask = mask.unsqueeze(-3)
+        # mask: (..., 1, seq_len, seq_len) | (1, seq_len, seq_len) | None
+
+        values = scaled_dot_product(Q, K, V, mask=mask)
+
+        # values: (..., cnt_h, seq_len, d_value)
+        # W_o: (cnt_h, d_value, d_out)
+        return torch.einsum("ijk, ...ilj -> ...lk", self._W_o, values)
 
 
-@torch.compile
-def train_step(
-    model: LLM,
-    optimizer: optim.Optimizer,
-    inputs: Tensor,
-    masks: Tensor,
-    targets: Tensor,
-):
-    optimizer.zero_grad()
-    loss = calculate_loss(model, inputs, masks, targets, pad_index=PAD)
-    loss.backward()
-    optimizer.step()
+class TransformerBlock(nn.Module):
+    """One transformer block
 
+    This module consists of self-attention and feed-forward layers.
 
-class TrainState:
-    steps: int
-    time: float
+    Args:
+        x: (..., seq_len, dim)
+        mask: (..., seq_len), dtype=bool
+    Returns:
+        (..., seq_len, dim)
+    """
 
-    def __init__(self, steps: int = 0, time: float = 0.0):
-        self.steps = steps
-        self.time = time
+    def __init__(self, cnt_h: int, dim: int, d_key: int, d_value: int, d_hidden: int):
+        super().__init__()
 
-
-def train(
-    state: TrainState,
-    model: LLM,
-    optimizer: optim.Optimizer,
-    batch_size: int,
-    batches: int,
-    epochs: int,
-):
-    for epoch in range(epochs):
-        print(f"Epoch: {epoch}")
-
-        start_t = last_t = time.perf_counter()
-        batch_delta_t = 0
-
-        last_state_time = state.time
-
-        for i in range(batches):
-            # prepare data
-            inputs, masks, targets = prepare_data(batch_size)
-
-            # train
-            model.train()
-
-            train_step(model, optimizer, inputs, masks, targets)
-
-            state.steps += 1
-
-            t = time.perf_counter()
-            delta_t = t - last_t
-            last_t = t
-
-            batch_delta_t += delta_t
-            state.time += delta_t
-
-            # val
-            if i % 100 == 99:
-
-                model.eval()
-
-                with torch.no_grad():
-                    train_inputs, train_masks, tarin_targets = prepare_data(200)
-                    val_inputs, val_masks, val_targets = prepare_data(200)
-
-                    train_loss = calculate_loss(
-                        model,
-                        train_inputs,
-                        train_masks,
-                        tarin_targets,
-                        pad_index=PAD,
-                    ).item()
-                    val_loss = calculate_loss(
-                        model, val_inputs, val_masks, val_targets, pad_index=PAD
-                    ).item()
-
-                print(
-                    f"  Step {i+1:04d}/{batches:04d} {batch_delta_t:10.6f} s: train loss {train_loss:10.6f}, val loss {val_loss:10.6f}"
-                )
-
-                # writer.add_scalar("loss/train", train_loss, state.steps)
-                # writer.add_scalar("loss/val", val_loss, state.steps)
-                # writer.flush()
-
-                batch_delta_t = 0
-
-        print(
-            f"  Epoch time: {state.time - last_state_time:10.6f} s, total time: {state.time:.6f} s"
+        self._attention = Attention(
+            cnt_h=cnt_h,
+            d_in=dim,
+            d_out=dim,
+            d_key=d_key,
+            d_value=d_value,
         )
 
-    print("Done.")
+    def forward(self, x: Tensor, mask: Tensor) -> Tensor:
+        y = x
+        x = self._attention(x, mask)
+
+        # NOTE(tianjiao): This is essential to the BUG.
+        x += y
+
+        return x
 
 
-# %%
-dim = 16
-model = LLM(
-    tokenizer.vocab_size,
-    max_seq_len,
-    cnt_h=2,
-    dim=dim,
-    d_key=dim,
-    d_value=dim,
-    d_hidden=dim,
-)
+class Embedding(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int):
+        super().__init__()
+        self.A = nn.Parameter(torch.rand(vocab_size, embed_dim))
 
-# writer.add_graph(model, (example_inputs, example_masks))
-# writer.flush()
+    def forward(self, x):
+        # (...,seq_len)
+        return self.A[x]
 
-train_state = TrainState()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# %%
-train(train_state, model, optimizer, 16, 1000, 10)
+class LLM(nn.Module):
+    """The full LLM
+
+    Args:
+        tokens: (..., seq_len), dtype=int
+        mask: (..., seq_len), dtype=bool
+    Returns:
+        (..., vocab_size)
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        cnt_h: int,
+        dim: int,
+        d_key: int,
+        d_value: int,
+        d_hidden: int,
+    ):
+        super().__init__()
+
+        self._token_embedding = Embedding(vocab_size, dim)
+        self._transformer = TransformerBlock(
+            cnt_h=cnt_h, dim=dim, d_key=d_key, d_value=d_value, d_hidden=d_hidden
+        )
+        self._head = nn.Linear(dim, vocab_size)
+
+    def forward(self, tokens: Tensor, mask: Tensor) -> Tensor:
+        x = self._token_embedding(tokens)
+        x = self._transformer(x, mask)
+        x = self._head(x)
+        return x
+
+
+def calculate_loss(
+    model: LLM,
+    input: Tensor,
+    mask: Tensor,
+    target: Tensor,
+    pad_index: int,
+) -> Tensor:
+    """
+    Args:
+        input: (..., seq_len), dtype=int
+        mask: (..., seq_len), dtype=bool
+        target: (..., seq_len), dtype=int
+    """
+
+    torch._assert(input.shape == target.shape, "shape not matched")
+
+    logits: Tensor = model(input, mask)  # (..., seq_len, vocab_size)
+    loss = nn.functional.cross_entropy(
+        logits.flatten(0, -2), target.flatten(0, -1), ignore_index=pad_index
+    )
+
+    return loss
 
 
 # %%
 @torch.compile
-def generate_step(model: LLM, input: Tensor) -> Tensor:
-    return model(input)
+def train_step(model: LLM, inputs: Tensor, masks: Tensor, targets: Tensor):
+    loss = calculate_loss(model, inputs, masks, targets, pad_index=0)
+    loss.backward()
 
 
-def generate(model: LLM, text: str, max_new_tokens: int, temperature: float):
+# %%
+max_seq_len = 4
 
-    tokens = tokenizer.encode(text)
+model = LLM(
+    vocab_size=2,
+    cnt_h=1,
+    dim=8,
+    d_key=1,
+    d_value=1,
+    d_hidden=1,
+)
 
-    model.eval()
+batch_size = 2
 
-    for _ in range(max_new_tokens):
-        input = tokens[-max_seq_len:]
+inputs = torch.tensor([[0, 0, 0, 1], [0, 0, 0, 0]])
+masks = torch.zeros(batch_size, max_seq_len, dtype=torch.bool)
+targets = torch.zeros(batch_size, max_seq_len, dtype=torch.int)
 
-        with torch.no_grad():
-            logits = generate_step(model, torch.tensor(input))  # (seq_len, vocab_size)
+# train
+model.train()
 
-        logits = logits[-1, :]  # (vocab_size)
-        probs = torch.softmax(logits / temperature, dim=-1)
-        next = int(torch.multinomial(probs, num_samples=1).item())
+print(inputs)
 
-        tokens.append(next)
-
-        print(tokenizer.decode([next]), end="", flush=True)
-
-    return tokens
-
-
-print("generated text:")
-tokens = generate(model, "The", 1000, 0.5)
-
-# # %%
-# loss = calculate_loss(
-#     model, example_inputs, example_masks, example_targets, pad_index=PAD
-# )
-# print("loss on examples:", loss.item())
-
-# # %%
-# for param in model.parameters():
-#     print("================")
-#     print(param.shape)
-#     print(param)
-
-# # %%
-# batch_size = torch.export.Dim("batch_size")
-# seq_len = torch.export.Dim("seq_len")
-# dynamic_shapes = {
-#     "tokens": {0: batch_size, 1: seq_len},
-#     "mask": {0: batch_size, 1: seq_len},
-# }
-
-# model.train()
-# torch.onnx.export(
-#     model,
-#     (example_inputs, example_masks),
-#     "llm.onnx",
-#     export_params=True,
-#     input_names=["tokens", "mask"],
-#     output_names=["logits"],
-#     dynamic_shapes=dynamic_shapes,
-#     dynamo=True,
-#     training=torch.onnx.TrainingMode.TRAINING,
-# )
+train_step(model, inputs, masks, targets)
